@@ -34,7 +34,13 @@ type UserInfo struct {
 }
 
 func NewProvider(issuer, clientID string) *Provider {
-	privKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	slog.Info("Initializing new OIDC provider", "issuer", issuer, "clientID", clientID)
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		slog.Error("Failed to generate RSA private key", "error", err)
+		return nil
+	}
+	slog.Info("Successfully generated RSA private key")
 	return &Provider{
 		Issuer:   issuer,
 		ClientID: clientID,
@@ -48,22 +54,20 @@ func NewProvider(issuer, clientID string) *Provider {
 }
 
 func (p *Provider) HandleRoot(w http.ResponseWriter, r *http.Request) {
-
-	// if code is not in the url, redirect to discovery endpoint
+	slog.Info("HandleRoot called", "method", r.Method, "url", r.URL.String())
 	if r.URL.Query().Get("code") == "" {
+		slog.Info("No code found in URL, redirecting to discovery endpoint")
 		http.Redirect(w, r, p.Issuer+"/.well-known/openid-configuration", http.StatusFound)
 		return
 	}
 
-	// if code is in the url, continue to HandleToken
+	slog.Info("Code found in URL, proceeding to HandleToken")
 	p.HandleToken(w, r)
 }
 
 func (p *Provider) HandleDiscovery(w http.ResponseWriter, r *http.Request) {
-	// Log the request
-	slog.Info("Discovery request", "url", r.URL.String())
+	slog.Info("Discovery request received", "method", r.Method, "url", r.URL.String())
 
-	// Allow all origins
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -94,28 +98,34 @@ func (p *Provider) HandleDiscovery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(discovery)
+	if err := json.NewEncoder(w).Encode(discovery); err != nil {
+		slog.Error("Failed to encode discovery response", "error", err)
+		http.Error(w, "Failed to encode discovery response", http.StatusInternalServerError)
+	}
 }
 
 func (p *Provider) HandleAuth(w http.ResponseWriter, r *http.Request) {
+	slog.Info("HandleAuth called", "method", r.Method, "url", r.URL.String())
 	nonce := r.URL.Query().Get("nonce")
 	state := r.URL.Query().Get("state")
 	redirectURI := r.URL.Query().Get("redirect_uri")
 
-	// Log the request
-	slog.Info("Auth request", "url", r.URL.String(), "nonce", nonce, "state", state, "redirect_uri", redirectURI)
+	slog.Info("Auth request parameters", "nonce", nonce, "state", state, "redirect_uri", redirectURI)
 
-	// Define default values
 	defaultValues := UserInfo{
 		Name:   "John Doe",
 		Email:  "john@example.com",
 		Groups: []string{"users", "developers"},
 	}
 
-	// Try to get values from cookie
 	if cookie, err := r.Cookie("user_settings"); err == nil {
-		jsonData, _ := base64.StdEncoding.DecodeString(cookie.Value)
-		json.Unmarshal(jsonData, &defaultValues)
+		jsonData, err := base64.StdEncoding.DecodeString(cookie.Value)
+		if err == nil {
+			slog.Info("Loaded user settings from cookie", "user_settings", string(jsonData))
+			json.Unmarshal(jsonData, &defaultValues)
+		} else {
+			slog.Warn("Failed to decode user settings cookie", "error", err)
+		}
 	}
 
 	tmpl := template.Must(template.New("auth").Parse(`
@@ -136,17 +146,21 @@ func (p *Provider) HandleAuth(w http.ResponseWriter, r *http.Request) {
 	`))
 
 	if r.Method == "GET" {
-		tmpl.Execute(w, map[string]interface{}{
+		if err := tmpl.Execute(w, map[string]interface{}{
 			"Nonce":         nonce,
 			"State":         state,
 			"RedirectURI":   redirectURI,
 			"DefaultValues": defaultValues,
 			"Groups":        strings.Join(defaultValues.Groups, ","),
-		})
+		}); err != nil {
+			slog.Error("Failed to execute auth template", "error", err)
+			http.Error(w, "Failed to render authorization page", http.StatusInternalServerError)
+		}
 		return
 	}
 
 	if r.Method == "POST" {
+		slog.Info("Processing POST request for HandleAuth")
 		r.ParseForm()
 		userInfo := UserInfo{
 			Sub:    "user123",
@@ -155,36 +169,48 @@ func (p *Provider) HandleAuth(w http.ResponseWriter, r *http.Request) {
 			Groups: strings.Split(r.FormValue("groups"), ","),
 		}
 
-		// Save user settings in a cookie
-		jsonData, _ := json.Marshal(userInfo)
+		slog.Info("User info received from form", "userInfo", userInfo)
+
+		jsonData, err := json.Marshal(userInfo)
+		if err != nil {
+			slog.Error("Failed to marshal user info", "error", err)
+			http.Error(w, "Failed to process user information", http.StatusInternalServerError)
+			return
+		}
 		encodedData := base64.StdEncoding.EncodeToString(jsonData)
 		http.SetCookie(w, &http.Cookie{
 			Name:    "user_settings",
 			Value:   encodedData,
-			Expires: time.Now().Add(30 * 24 * time.Hour), // Cookie expires in 30 days
+			Expires: time.Now().Add(30 * 24 * time.Hour),
 			Path:    "/",
 		})
 
+		slog.Info("User settings saved in cookie", "encodedData", encodedData)
+
 		code := generateRandomString(32)
 		p.storeTempUserInfo(code, userInfo, r.FormValue("nonce"))
+
+		slog.Info("Generated authorization code", "code", code)
 
 		redirectURL := r.FormValue("redirect_uri") + "?code=" + code
 		if state := r.FormValue("state"); state != "" {
 			redirectURL += "&state=" + state
 		}
+		slog.Info("Redirecting to", "redirectURL", redirectURL)
 		http.Redirect(w, r, redirectURL, http.StatusFound)
 	}
 }
 
 func (p *Provider) HandleToken(w http.ResponseWriter, r *http.Request) {
+	slog.Info("HandleToken called", "method", r.Method, "url", r.URL.String())
 	code := r.FormValue("code")
 	userInfo, nonce, ok := p.retrieveTempUserInfo(code)
 	if !ok {
+		slog.Warn("Invalid authorization code", "code", code)
 		http.Error(w, "Invalid code", http.StatusBadRequest)
 		return
 	}
 
-	// Log the request
 	slog.Info("Token request", "code", code, "nonce", nonce, "userInfo", userInfo)
 
 	idToken := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
@@ -200,9 +226,17 @@ func (p *Provider) HandleToken(w http.ResponseWriter, r *http.Request) {
 		"nonce":          nonce,
 	})
 
-	idTokenString, _ := idToken.SignedString(p.privKey)
+	idTokenString, err := idToken.SignedString(p.privKey)
+	if err != nil {
+		slog.Error("Failed to sign ID token", "error", err)
+		http.Error(w, "Failed to generate ID token", http.StatusInternalServerError)
+		return
+	}
+
+	slog.Info("Generated ID token", "idToken", idTokenString)
 
 	accessToken := generateRandomString(32)
+	slog.Info("Generated access token", "accessToken", accessToken)
 
 	response := map[string]interface{}{
 		"access_token": accessToken,
@@ -212,13 +246,18 @@ func (p *Provider) HandleToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Error("Failed to encode token response", "error", err)
+		http.Error(w, "Failed to encode token response", http.StatusInternalServerError)
+	}
 }
 
 func (p *Provider) HandleUserInfo(w http.ResponseWriter, r *http.Request) {
+	slog.Info("HandleUserInfo called", "method", r.Method, "url", r.URL.String())
 	authHeader := r.Header.Get("Authorization")
 	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 
+	slog.Info("Parsing token", "tokenString", tokenString)
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		return p.pubKey, nil
 	})
@@ -228,7 +267,15 @@ func (p *Provider) HandleUserInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	claims := token.Claims.(jwt.MapClaims)
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok || !token.Valid {
+		slog.Error("Invalid token claims")
+		http.Error(w, "Invalid token", http.StatusUnauthorized)
+		return
+	}
+
+	slog.Info("Token parsed successfully", "claims", claims)
+
 	userInfo := UserInfo{
 		Sub:    claims["sub"].(string),
 		Name:   claims["name"].(string),
@@ -237,11 +284,14 @@ func (p *Provider) HandleUserInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(userInfo)
+	if err := json.NewEncoder(w).Encode(userInfo); err != nil {
+		slog.Error("Failed to encode user info response", "error", err)
+		http.Error(w, "Failed to encode user info response", http.StatusInternalServerError)
+	}
 }
 
 func (p *Provider) HandleJWKS(w http.ResponseWriter, r *http.Request) {
-	// Allow all origins
+	slog.Info("HandleJWKS called", "method", r.Method, "url", r.URL.String())
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
@@ -263,28 +313,41 @@ func (p *Provider) HandleJWKS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(jwks)
+	if err := json.NewEncoder(w).Encode(jwks); err != nil {
+		slog.Error("Failed to encode JWKS response", "error", err)
+		http.Error(w, "Failed to encode JWKS response", http.StatusInternalServerError)
+	}
 }
 
 func interfaceSliceToStringSlice(slice []interface{}) []string {
+	slog.Info("Converting interface slice to string slice", "slice", slice)
 	result := make([]string, len(slice))
 	for i, v := range slice {
-		result[i] = v.(string)
+		str, ok := v.(string)
+		if !ok {
+			slog.Warn("Failed to convert interface to string", "value", v)
+			result[i] = ""
+		} else {
+			result[i] = str
+		}
 	}
 	return result
 }
 
 func generateRandomString(length int) string {
+	slog.Info("Generating random string", "length", length)
 	b := make([]byte, length)
-	rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		slog.Error("Failed to generate random string", "error", err)
+		return ""
+	}
+	result := base64.RawURLEncoding.EncodeToString(b)
+	slog.Info("Generated random string", "result", result)
+	return result
 }
 
-// Add these functions to store and retrieve temporary user info
 func (p *Provider) storeTempUserInfo(code string, userInfo UserInfo, nonce string) {
-	// In a real implementation, you'd use a secure storage mechanism
-	// For this example, we'll use a simple in-memory map
-	// This is not thread-safe, so you'd need to add proper synchronization in a real scenario
+	slog.Info("Storing temporary user info", "code", code, "userInfo", userInfo, "nonce", nonce)
 	p.tempStorage[code] = struct {
 		UserInfo UserInfo
 		Nonce    string
@@ -292,14 +355,17 @@ func (p *Provider) storeTempUserInfo(code string, userInfo UserInfo, nonce strin
 }
 
 func (p *Provider) retrieveTempUserInfo(code string) (UserInfo, string, bool) {
+	slog.Info("Retrieving temporary user info", "code", code)
 	if info, ok := p.tempStorage[code]; ok {
+		slog.Info("Successfully retrieved temporary user info", "code", code, "userInfo", info.UserInfo, "nonce", info.Nonce)
 		delete(p.tempStorage, code)
 		return info.UserInfo, info.Nonce, true
 	}
+	slog.Warn("Failed to retrieve temporary user info", "code", code)
 	return UserInfo{}, "", false
 }
 
-// Add this method to the UserInfo struct
 func (u *UserInfo) GroupsString() string {
+	slog.Info("Converting groups to string", "groups", u.Groups)
 	return strings.Join(u.Groups, ",")
 }
