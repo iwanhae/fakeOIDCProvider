@@ -1,14 +1,11 @@
-FROM golang:1.23
+FROM golang:1.23 AS build
 
-WORKDIR /app
-
-COPY go.mod go.sum ./
-RUN go mod download
-
+WORKDIR /go/src/example
 COPY . .
+RUN CGO_ENABLED=0 go build -o /go/bin/example
 
-RUN go build -o main .
-
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /go/bin/example /
 EXPOSE 8081
 
-CMD ["./main"]
+ENTRYPOINT [ "/example" ]

@@ -6,6 +6,7 @@ import (
 	"log"
 	"log/slog"
 	"net/http"
+	"os"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"golang.org/x/oauth2"
@@ -14,7 +15,12 @@ import (
 func main() {
 	ctx := context.Background()
 
-	provider, err := oidc.NewProvider(ctx, "http://localhost:8080")
+	EnvOIDCEndpoint := os.Getenv("OIDC_ENDPOINT")
+	if EnvOIDCEndpoint == "" {
+		log.Fatalf("OIDC_ENDPOINT is not set")
+	}
+
+	provider, err := oidc.NewProvider(ctx, EnvOIDCEndpoint)
 	if err != nil {
 		log.Fatalf("Failed to create provider: %v", err)
 	}
